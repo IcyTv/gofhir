@@ -1,0 +1,20 @@
+{
+	"name": "tester",
+	"version": "1.0.0",
+	"main": "index.js",
+	"license": "MIT",
+	"devDependencies": {
+		"@types/jest": "^29.5.1",
+		"@types/node": "^20.2.1",
+		"ts-node": "^10.9.1",
+		"typescript": "^5.0.4"
+	},
+	"scripts": {
+		"start": "jest"
+	},
+	"dependencies": {
+		"jest": "^29.5.0",
+		"mongodb": "^5.5.0",
+		"ts-jest": "^29.1.0"
+	}
+}
