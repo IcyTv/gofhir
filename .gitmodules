@@ -1,0 +1,6 @@
+[submodule "tests/tester/tests/crucible"]
+	path = tests/tester/tests/crucible
+	url = https://github.com/fhir-crucible/crucible.git
+[submodule "tests/crucible"]
+	path = tests/crucible
+	url = https://github.com/fhir-crucible/crucible.git
