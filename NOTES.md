@@ -1,0 +1,1 @@
+-   I manually edited `profiles-types.json`'s Meta struct, by changing the `versionId` field from an `Id` type, which gets translated to an `ObjectId` to a `number` type. This allows us to have incremental version ids, which is what we want.

@@ -22,18 +22,39 @@ func check(e error) {
 var wg sync.WaitGroup
 
 func main() {
+	TypeRegistry = []string{}
+
 	// Path relative to the project root -> "<project_root>/assets/definitions"
 	def_path := "assets/definitions"
 	out_path := "generated"
 
-	GenerateFile(def_path+"/profiles-types.json", out_path+"/fhirtypes.go", out_path+"/httptypes.go")
-	GenerateFile(def_path+"/profiles-resources.json", out_path+"/fhirresources.go", out_path+"/httpresources.go")
-	GenerateFile(def_path+"/profiles-others.json", out_path+"/fhirothers.go", out_path+"/httpothers.go")
+	GenerateFile(def_path+"/profiles-types.json", out_path+"/fhirtypes.go", out_path+"/httptypes.go", out_path+"/dbtypes.go")
+	GenerateFile(def_path+"/profiles-resources.json", out_path+"/fhirresources.go", out_path+"/httpresources.go", out_path+"/dbresources.go")
+	GenerateFile(def_path+"/profiles-others.json", out_path+"/fhirothers.go", out_path+"/httpothers.go", out_path+"/dbothers.go")
+
+	GenerateTypeRegistry()
 
 	wg.Wait()
 }
 
-func GenerateFile(infile string, outfile string, http_outfile string) {
+var TypeRegistry []string
+
+func GenerateTypeRegistry() {
+	f := jen.NewFile("generated")
+
+	f.Var().Id("TypeRegistry").Op("=").Map(jen.String()).Qual("reflect", "Type").Values(jen.DictFunc(func(d jen.Dict) {
+		for _, t := range TypeRegistry {
+			d[jen.Lit(t)] = jen.Qual("reflect", "TypeOf").Call(jen.Parens(jen.Op("*").Id(t)).Call(jen.Nil())).Dot("Elem").Call()
+		}
+	}))
+
+	out_file, err := os.Create("generated/typeregistry.go")
+	check(err)
+	defer out_file.Close()
+	check(f.Render(out_file))
+}
+
+func GenerateFile(infile string, outfile string, http_outfile string, db_outfile string) {
 	types_file, err := os.ReadFile(infile)
 	check(err)
 
@@ -52,8 +73,16 @@ func GenerateFile(infile string, outfile string, http_outfile string) {
 		capabilityStatements = append(capabilityStatements, e.Resource)
 	}
 
-	go GenerateStructures(entries, outfile)
+	GenerateStructures(entries, outfile)
 	go GenerateHttp(capabilityStatements, http_outfile)
+
+	name := strings.TrimSuffix(strings.Split(infile, "profiles-")[1], ".json")
+
+	// TODO this is a hack.... How do we decide which files to actually generate?
+	//     I think generally we should only generate collections for top level resources...
+	// if name == "resource" {
+	go GenerateDatabase(name, entries, db_outfile)
+	// }
 }
 
 func GenerateStructures(entries []base.StructureDefinition, outfile string) {
@@ -77,13 +106,15 @@ func GenerateStructures(entries []base.StructureDefinition, outfile string) {
 			continue
 		}
 
+		TypeRegistry = append(TypeRegistry, SanitizeStructName(t.Name))
+
 		tree := NewStructureTree()
 		for _, e := range t.Snapshot.Element {
 			tree.AddElement(e)
 		}
 
 		res := tree.GenerateCode(cycles)
-		f.Add(res...)
+		f.Add(res.Definitions...)
 	}
 
 	out_file, err := os.Create(outfile)
@@ -121,8 +152,11 @@ func GenerateHttp(caps []base.CapabilityStatement, outfile string) {
 						inner = append(inner, GenerateRead(resource.Type))
 					case "update":
 						inner = append(inner, GenerateUpdate(resource.Type))
+						inner = append(inner, GeneratePatch(resource.Type))
 					case "create":
 						inner = append(inner, GenerateCreate(resource.Type))
+					case "vread":
+						inner = append(inner, GenerateVRead(resource.Type))
 					default:
 						fmt.Println("Unknown interaction", interaction.Code)
 					}
@@ -154,6 +188,73 @@ func GenerateHttp(caps []base.CapabilityStatement, outfile string) {
 	out_file, err := os.Create(outfile)
 	check(err)
 	defer out_file.Close()
+	check(f.Render(out_file))
+
+	wg.Done()
+}
+
+func returnErr() *jen.Statement {
+	return jen.If(
+		jen.Id("err").Op("!=").Nil(),
+	).Block(
+		jen.Return(jen.Id("err")),
+	)
+}
+
+// TODO think, how do we need to generate collections?
+func GenerateDatabase(name string, entries []base.StructureDefinition, outfile string) {
+	wg.Add(1)
+	// This function generates a single function that creates all the collections
+	// (and eventually indices) for the database
+
+	f := jen.NewFile("generated")
+
+	statements := []jen.Code{
+		jen.Var().Id("err").Error(),
+	}
+
+	for _, entry := range entries {
+		// If the entry is abstract, don't generate a collection for it
+		if entry.Abstract {
+			continue
+		}
+
+		if entry.Kind != "resource" {
+			continue
+		}
+
+		name := entry.Name
+
+		statements = append(statements, jen.Line().Id("err").Op("=").Id("db").Dot("CreateCollection").Call(
+			jen.Qual("context", "TODO").Call(),
+			jen.Lit(name),
+			jen.Op("&").Qual("go.mongodb.org/mongo-driver/mongo/options", "CreateCollectionOptions").Values(
+				jen.Id("ChangeStreamPreAndPostImages").Op(":").Qual("go.mongodb.org/mongo-driver/bson", "M").Values(
+					jen.Lit("enabled").Op(":").True(),
+				),
+			),
+		))
+		statements = append(statements, returnErr())
+	}
+
+	statements = append(statements, jen.Line().Return(jen.Nil()))
+
+	if len(statements) == 2 {
+		wg.Done()
+		return
+	}
+
+	f.Func().Id(name + "CreateCollections").Params(
+		jen.Id("db").Op("*").Qual("go.mongodb.org/mongo-driver/mongo", "Database"),
+	).Error().Block(
+		statements...,
+	)
+
+	out_file, err := os.Create(outfile)
+
+	check(err)
+	defer out_file.Close()
+
 	check(f.Render(out_file))
 
 	wg.Done()
@@ -239,15 +340,57 @@ func (st *StructureTree) AddElement(e base.ElementDefinition) {
 	node.Max = e.Max
 }
 
-func (st *StructureTree) GenerateCode(cycles map[string]struct{}) []jen.Code {
+// Meta object definition
+//   - versionId     0..1              id
+//   - lastUpdated   0..1              instant
+//   - source        0..1              uri
+//   - profile       0..*              canonical
+//   - security      0..*              Coding (Security labels applied to this resource)
+//   - tag           0..*              Coding (Tags applied to this resource)
+func (st *StructureTree) AddMeta() {
+	// I think for now we'll ignore source, profile, security and tag.
+	// Also we'll need to think about when something is a subtype of Resource, and therefore has a meta field. Currently we'll just apply this to everything.
+
+	st.Next["meta"] = &StructureTree{
+		Name: "meta",
+		Path: "meta",
+		Next: map[string]*StructureTree{
+			"versionId": {
+				Name: "versionId",
+				Path: "meta.versionId",
+				Next: map[string]*StructureTree{},
+				Types: []string{
+					"Id",
+				},
+			},
+			"lastUpdated": {
+				Name: "lastUpdated",
+				Path: "meta.lastUpdated",
+				Next: map[string]*StructureTree{},
+				Types: []string{
+					"Instant",
+				},
+			},
+		},
+	}
+}
+
+type CodegenOutput struct {
+	Definitions []jen.Code
+	Fields      []jen.Code
+}
+
+func (st *StructureTree) GenerateCode(cycles map[string]struct{}) CodegenOutput {
 	var Out []jen.Code
 	if st.Name == "" {
 		for _, n := range st.Next {
 			res := n.GenerateCode(cycles)
-			Out = append(Out, res...)
+			Out = append(Out, res.Definitions...)
 		}
 
-		return Out
+		return CodegenOutput{
+			Definitions: Out,
+		}
 	} else {
 		if len(st.Types) > 1 {
 			name := SanitizeStructName(st.Path)
@@ -256,7 +399,8 @@ func (st *StructureTree) GenerateCode(cycles map[string]struct{}) []jen.Code {
 				tags := map[string]string{
 					"json": ConcatEnumName(st.Name, t) + ",omitempty",
 					// "mapstructure": ConcatEnumName(st.Name, t),
-					"bson": ",omitempty",
+					"bson":    ",omitempty",
+					"binding": "omitempty",
 				}
 
 				Fields = append(Fields,
@@ -268,14 +412,24 @@ func (st *StructureTree) GenerateCode(cycles map[string]struct{}) []jen.Code {
 				Fields...,
 			)
 
-			return append(
-				[]jen.Code{
-					jen.Id(SanitizeStructName(st.Path)),
-					str,
-					jen.Line(),
+			// return append(
+			// 	[]jen.Code{
+			// 		jen.Id(SanitizeStructName(st.Path)),
+			// 		str,
+			// 		jen.Line(),
+			// 	},
+			// 	Out...,
+			// )
+
+			return CodegenOutput{
+				Fields: []jen.Code{
+					jen.Id(SanitizeStructName(st.Path)).Tag(map[string]string{"json": ",omitempty", "bson": ",omitempty", "binding": "omitempty"}),
 				},
-				Out...,
-			)
+				Definitions: append(
+					Out,
+					str.Line(),
+				),
+			}
 		} else if len(st.Next) > 0 {
 			var Fields []jen.Code
 			var FieldDefs []jen.Code
@@ -283,8 +437,8 @@ func (st *StructureTree) GenerateCode(cycles map[string]struct{}) []jen.Code {
 
 			for _, n := range st.Next {
 				gen := n.GenerateCode(cycles)
-				Fields = append(Fields, gen[0])
-				FieldDefs = append(FieldDefs, gen[1:]...)
+				Fields = append(Fields, gen.Fields...)
+				FieldDefs = append(FieldDefs, gen.Definitions...)
 				UnmarshalFields = append(UnmarshalFields, GenerateUnmarshal(SanitizeFieldName(n.Name), n))
 			}
 
@@ -319,48 +473,48 @@ func (st *StructureTree) GenerateCode(cycles map[string]struct{}) []jen.Code {
 				jen.Return(jen.Nil()),
 			)
 
-			unmarshalJson := jen.Func().Params(jen.Id("out").Op("*").Id(SanitizeStructName(st.Path))).Id("UnmarshalJSON").Params(jen.Id("data").Index().Byte()).Params(jen.Error()).Block(
+			unmarshalJson := jen.Line().Func().Params(jen.Id("out").Op("*").Id(SanitizeStructName(st.Path))).Id("UnmarshalJSON").Params(jen.Id("data").Index().Byte()).Params(jen.Error()).Block(
 				UnmarshalBlock...,
 			).Line()
 
-			if len(strings.Split(st.Path, ".")) > 1 {
-				return append(
-					[]jen.Code{
-						jen.Id(SanitizeFieldName(st.Name)).Op("*").Id(SanitizeStructName(st.Path)).Tag(map[string]string{"binding": "omitempty", "bson": ",omitempty"}),
-						unmarshalJson,
-						jen.Type().Id(SanitizeStructName(st.Path)).Struct(Fields...),
-						jen.Line(),
-					},
-					FieldDefs...,
-				)
-			} else {
-				//FIXME move this logic to the if statement at the beginning?
-				return append(
-					[]jen.Code{
-						unmarshalJson,
-						jen.Type().Id(SanitizeStructName(st.Name)).Struct(
-							append(Fields,
-								jen.Id("ResourceType").String().Tag(map[string]string{"json": "resourceType", "binding": "omitempty", "bson": "-"}),
-							)...,
-						),
-						jen.Line(),
-					},
-					FieldDefs...,
-				)
+			if len(strings.Split(st.Path, ".")) == 1 {
+				// TODO this adds to the wrong things... Fix this...
+				// "binding": "omitempty",
+				Fields = append(Fields, jen.Id("ResourceType").String().Tag(map[string]string{"json": "resourceType,omitempty", "bson": "-"}))
 			}
+
+			return CodegenOutput{
+				Fields: []jen.Code{
+					// "binding": "omitempty",
+					jen.Id(SanitizeFieldName(st.Name)).Op("*").Id(SanitizeStructName(st.Path)).Tag(map[string]string{"bson": ",omitempty", "json": st.Name + ",omitempty"}),
+				},
+				Definitions: append(
+					FieldDefs,
+					unmarshalJson,
+					jen.Type().Id(SanitizeStructName(st.Path)).Struct(
+						Fields...,
+					).Line(),
+				),
+			}
+
 		} else {
 			if len(st.Types) == 0 {
-				return []jen.Code{
-					jen.Id(SanitizeFieldName(st.Name)).Id("interface{}"),
+				// return []jen.Code{
+				// 	jen.Id(SanitizeFieldName(st.Name)).Id("interface{}"),
+				// }
+				return CodegenOutput{
+					Fields: []jen.Code{
+						jen.Id(SanitizeFieldName(st.Name)).Id("interface{}"),
+					},
 				}
 			}
 
 			fieldType := SanitizeTypes(st.Types[0])
 
-			if _, ok := cycles[st.Path]; ok {
-				// fieldType = "*" + fieldType
-				fieldType = jen.Op("*").Add(fieldType)
-			}
+			// if _, ok := cycles[st.Path]; ok {
+			// 	// fieldType = "*" + fieldType
+			// 	fieldType = jen.Op("*").Add(fieldType)
+			// }
 
 			if st.Max == "*" {
 				fieldType = jen.Index().Add(fieldType)
@@ -380,8 +534,18 @@ func (st *StructureTree) GenerateCode(cycles map[string]struct{}) []jen.Code {
 				tag["bson"] = "_id,omitempty"
 			}
 
-			return []jen.Code{
+			Fields := []jen.Code{
 				jen.Id(SanitizeFieldName(st.Name)).Add(fieldType).Tag(tag).Comment(st.Docs),
+			}
+
+			if IsPrimitiveType(st.Types[0]) {
+				Fields = append(Fields,
+					st.GeneratePrimitiveExtensionField(),
+				)
+			}
+
+			return CodegenOutput{
+				Fields: Fields,
 			}
 		}
 
@@ -403,10 +567,21 @@ func GenerateUnmarshal(fieldName string, n *StructureTree) jen.Code {
 		var UnmarshalFields []jen.Code
 		for _, t := range n.Types {
 			fieldName := ConcatEnumName(n.Name, t)
+			// Unmarshal := jen.If(
+			// 	jen.Id("err").Op(":=").Qual("github.com/json-iterator/go", "Unmarshal").Call(jen.Id("asMap").Index(jen.Lit(fieldName)), jen.Op("&").Id("out").Dot(strcase.ToCamel(fieldName))),
+			// 	jen.Id("err").Op("==").Nil(),
+			// ).Block().Else()
+
 			Unmarshal := jen.If(
-				jen.Id("err").Op(":=").Qual("github.com/json-iterator/go", "Unmarshal").Call(jen.Id("asMap").Index(jen.Lit(fieldName)), jen.Op("&").Id("out").Dot(strcase.ToCamel(fieldName))),
-				jen.Id("err").Op("==").Nil(),
-			).Block().Else()
+				jen.Len(jen.Id("asMap").Index(jen.Lit(fieldName))).Op(">").Lit(0),
+			).Block(
+				jen.If(
+					jen.Id("err").Op(":=").Qual("github.com/json-iterator/go", "Unmarshal").Call(jen.Id("asMap").Index(jen.Lit(fieldName)), jen.Op("&").Id("out").Dot(strcase.ToCamel(fieldName))),
+					jen.Id("err").Op("==").Nil(),
+				).Block(
+				//TODO i think we want an either or?
+				),
+			).Else()
 
 			UnmarshalFields = append(UnmarshalFields, Unmarshal)
 		}
@@ -421,6 +596,49 @@ func GenerateUnmarshal(fieldName string, n *StructureTree) jen.Code {
 		)
 
 		return Fields
+	} else if len(n.Types) > 0 && IsPrimitiveType(n.Types[0]) {
+		// If the field is a primitive type, unmarshal it directly into the field
+		// And unmarshal extension/id into the extension field
+
+		// Example (json)
+		// 	"count" : 2,
+		//   "_count" : {
+		//     "id" : "a1",
+		//     "extension" : [{
+		//       "url" : "...",
+		//       "valueXXX" : "...."
+		//     }]
+		//   }
+
+		Unmarshal := jen.If(
+			jen.Id("err").Op(":=").Qual("github.com/json-iterator/go", "Unmarshal").Call(jen.Id("asMap").Index(jen.Lit(n.Name)), jen.Op("&").Id("out").Dot(fieldName)),
+			jen.Id("err").Op("!=").Nil(),
+		).Block(
+			jen.Return(jen.Id("err")),
+		).Line()
+
+		if n.Min == 0 {
+			// If the field is optional test if the len(asMap[fieldName]) > 0
+			Unmarshal = jen.If(
+				jen.Len(jen.Id("asMap").Index(jen.Lit(n.Name))).Op(">").Lit(0),
+			).Block(
+				Unmarshal,
+			).Line()
+		}
+
+		Unmarshal = Unmarshal.Add(
+			jen.If(jen.Len(jen.Id("asMap").Index(jen.Lit("_" + n.Name))).Op(">").Lit(0).Block(
+				jen.If(
+					jen.Id("err").Op(":=").Qual("github.com/json-iterator/go", "Unmarshal").Call(jen.Id("asMap").Index(jen.Lit("_"+n.Name)), jen.Op("&").Id("out").Dot(fieldName+"PrimitiveExtension")),
+					jen.Id("err").Op("!=").Nil(),
+				).Block(
+					jen.Return(jen.Id("err")),
+				),
+			),
+			).Line(),
+		)
+
+		return Unmarshal
 	} else {
 		// Unmarshal this straight into the field
 		Unmarshal := jen.If(
@@ -462,15 +680,15 @@ func SanitizeTypes(s string) jen.Code {
 		"Code":         jen.String(),
 		"Decimal":      jen.Float64(),
 		"Id":           jen.Op("*").Qual("go.mongodb.org/mongo-driver/bson/primitive", "ObjectID"),
-		"Instant":      jen.Qual("time", "Time"),
+		"Instant":      jen.Op("*").Qual("time", "Time"),
 		"Markdown":     jen.String(),
 		"Oid":          jen.String(),
 		"Uri":          jen.String(),
-		"Url":          jen.Qual("net/url", "URL"),
-		"Time":         jen.Id("Time"),
-		"Date":         jen.Id("Date"),
-		"DateTime":     jen.Id("DateTime"),
-		"Uuid":         jen.Qual("github.com/google/uuid", "UUID"),
+		"Url":          jen.Op("*").Qual("net/url", "URL"),
+		"Time":         jen.Op("*").Id("Time"),
+		"Date":         jen.Op("*").Id("Date"),
+		"DateTime":     jen.Op("*").Id("DateTime"),
+		"Uuid":         jen.Op("*").Qual("github.com/google/uuid", "UUID"),
 		"Xhtml":        jen.String(),
 	}
 
@@ -484,7 +702,7 @@ func SanitizeTypes(s string) jen.Code {
 	if v, ok := typeMapper[ret]; ok {
 		return v
 	} else {
-		return jen.Id(ret)
+		return jen.Op("*").Id(ret)
 	}
 }
 

@@ -4,3 +4,6 @@
 [submodule "tests/crucible"]
 	path = tests/crucible
 	url = https://github.com/fhir-crucible/crucible.git
+[submodule "tests/synthea"]
+	path = tests/synthea
+	url = https://github.com/synthetichealth/synthea

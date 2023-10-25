@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 
@@ -11,6 +12,7 @@ import (
 
 var Client *mongo.Client
 var FhirDatabase *mongo.Database
+var VersioningDatabase *mongo.Database
 
 func check(e error) {
 	if e != nil {
@@ -19,6 +21,7 @@ func check(e error) {
 }
 
 func SetupDatabase() {
+	fmt.Println("Setting up database")
 	uri := os.Getenv("MONGODB_URI")
 	if uri == "" {
 		log.Fatal("You must set the 'MONGODB_URI' environment variable")
@@ -28,6 +31,7 @@ func SetupDatabase() {
 	check(err)
 
 	FhirDatabase = Client.Database("fhir")
+	VersioningDatabase = Client.Database("fhir-delta")
 }
 
 func DisconnectDatabase() {

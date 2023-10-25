@@ -7,21 +7,17 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/binding"
 	"github.com/gofhir/db"
+	"github.com/gofhir/db/versioning"
 	"github.com/gofhir/generated"
 	"github.com/joho/godotenv"
 )
-
-func check(e error) {
-	if e != nil {
-		panic(e)
-	}
-}
 
 //go:generate go run ./generator
 
@@ -34,6 +30,16 @@ func main() {
 
 	db.SetupDatabase()
 	defer db.DisconnectDatabase()
+
+	// Setup collections
+	generated.CreateCollections(db.FhirDatabase)
+
+	var waitGroup sync.WaitGroup
+
+	cancelFn, err := versioning.SetupChangeStream(&waitGroup, db.FhirDatabase)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	r := gin.Default()
 
@@ -68,7 +74,11 @@ func main() {
 	}
 
 	done := <-ctx.Done()
-	log.Println("Server exiting with code:", done)
+	log.Println("Server exiting with code:", done, " Waiting for change stream to close...")
+
+	cancelFn()
+	waitGroup.Wait()
 
 	log.Println("Server exiting")
+
 }

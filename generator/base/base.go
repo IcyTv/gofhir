@@ -15,6 +15,8 @@ type StructureDefinition struct {
 	Kind           string   `json:"kind"`
 	Type           string   `json:"type"`
 	BaseDefinition string   `json:"baseDefinition"`
+	Abstract       bool     `json:"abstract"`
+	Status         string   `json:"status"`
 }
 
 func (sd StructureDefinition) GetResourceType() string {
